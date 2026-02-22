@@ -3,8 +3,8 @@ import cors from "cors";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import pg from "pg";
 import dotenv from "dotenv";
-import multer from "multer"; // YENİ: Dosya yüklemek için
-import pdf from "pdf-extraction"; // YENİ: PDF okumak için
+import multer from "multer";
+import pdf from "pdf-extraction";
 
 dotenv.config();
 
@@ -23,12 +23,9 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Multer Ayarı: Yüklenen dosyayı diske kaydetmeden direkt RAM'de (memory) tutalım
 const upload = multer({ storage: multer.memoryStorage() });
+const PORT = process.env.PORT || 3000;
 
-const PORT = process.env.PORT;
-
-// YARDIMCI FONKSİYON: Metni Parçalara Böl
 function splitTextIntoChunks(text, size, overlap) {
   const chunks = [];
   let start = 0;
@@ -40,94 +37,132 @@ function splitTextIntoChunks(text, size, overlap) {
   }
   return chunks;
 }
-
-// YARDIMCI FONKSİYON: Bekleme (Rate Limit için)
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // ==========================================
-// 🚀 YENİ ENDPOINT: PDF YÜKLEME (UPLOAD)
+// 🧠 YENİ: SOHBET HAFIZASI YÖNETİMİ
 // ==========================================
-// 'document' adında bir dosya bekliyoruz
+// Kullanıcıların aktif sohbet oturumlarını burada saklayacağız.
+// Key: sessionId (Örn: "user123"), Value: Gemini Chat Objesi
+const activeChats = {};
+
+// ==========================================
+// 🚀 ENDPOINT: PDF YÜKLEME (UPLOAD)
+// ==========================================
 app.post("/api/upload", upload.single("document"), async (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: "Lütfen bir PDF dosyası yükleyin." });
-  }
-
+  if (!req.file) return res.status(400).json({ error: "Lütfen bir PDF yükleyin." });
   const client = await pool.connect();
-
   try {
-    console.log(`\n📥 Yeni Dosya Geldi: ${req.file.originalname}`);
-
-    // 1. PDF'i Bellekten Oku
     const pdfData = await pdf(req.file.buffer);
     const rawText = pdfData.text.replace(/\n/g, " ").replace(/\s+/g, " ");
+    if (rawText.length < 50) return res.status(400).json({ error: "PDF okunamadı." });
 
-    if (rawText.length < 50) {
-      return res.status(400).json({ error: "PDF okunamadı veya içi boş (Resim tabanlı olabilir)." });
-    }
-
-    // 2. Parçalara Böl
     const chunks = splitTextIntoChunks(rawText, 1000, 100);
-    console.log(`🧩 PDF ${chunks.length} parçaya bölündü. Kayıt başlıyor...`);
-
-    // 3. Vektöre Çevir ve Kaydet
     let successCount = 0;
+
     for (let i = 0; i < chunks.length; i++) {
       try {
         const result = await embeddingModel.embedContent(chunks[i]);
         const vector = result.embedding.values;
-        
-        await client.query(
-          "INSERT INTO documents (content, embedding) VALUES ($1, $2)",
-          [chunks[i], JSON.stringify(vector)]
-        );
+        await client.query("INSERT INTO documents (content, embedding) VALUES ($1, $2)", [chunks[i], JSON.stringify(vector)]);
         successCount++;
-        await sleep(500); // Google Rate Limit'e takılmamak için minik mola
+        await sleep(500);
       } catch (err) {
         console.error(`⚠️ Parça ${i+1} atlandı (Hata: ${err.message})`);
       }
     }
+    res.json({ message: "PDF kaydedildi.", totalChunksSaved: successCount });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+
+// ==========================================
+// 💬 ENDPOINT: SOHBET (CHAT HISTORY DESTEKLİ)
+// ==========================================
+// Artık body'den 'question' yanında opsiyonel olarak 'sessionId' bekliyoruz.
+app.post("/api/chat", async (req, res) => {
+  const { question, sessionId = "default_session" } = req.body;
+  if (!question) return res.status(400).json({ error: "Soru eksik." });
+
+  const client = await pool.connect();
+  
+  try {
+    // 1. SORUYU VEKTÖRE ÇEVİR VE VERİTABANINDA ARA (Klasik RAG)
+    const embeddingResult = await embeddingModel.embedContent(question);
+    const vectorStr = JSON.stringify(embeddingResult.embedding.values);
+
+    const sql = `SELECT content, (embedding <=> $1) as distance FROM documents ORDER BY distance ASC LIMIT 3;`;
+    const result = await client.query(sql, [vectorStr]);
+    
+    // Veritabanından gelen bilgileri birleştir
+    const contextData = result.rows.length > 0 
+      ? result.rows.map(r => r.content).join("\n\n---\n\n")
+      : "Veritabanında bu soruya dair doğrudan bir bilgi bulunamadı.";
+
+    // 2. OTURUM (SESSION) KONTROLÜ VE OLUŞTURMA
+    // Eğer bu sessionId için daha önce bir sohbet başlatılmadıysa, yeni başlat.
+    if (!activeChats[sessionId]) {
+      console.log(`🆕 Yeni bir sohbet oturumu başlatılıyor: [${sessionId}]`);
+      
+      activeChats[sessionId] = chatModel.startChat({
+        // İsteğe bağlı: Başlangıçta modele "Sen kimsin?" gibi sistem talimatları verebiliriz.
+        history: [
+          {
+            role: "user",
+            parts: [{ text: "Sen profesyonel bir asistansın. Sana vereceğim [VERİTABANI BİLGİSİ] bloklarına dayanarak sorularımı cevapla." }],
+          },
+          {
+            role: "model",
+            parts: [{ text: "Anladım. Sadece verdiğiniz bilgilere dayanarak cevap vereceğim." }],
+          },
+        ]
+      });
+    }
+
+    // 3. YAPAY ZEKAYA MESAJ GÖNDERME
+    // Kullanıcının sorusunu ve o anki veritabanı bağlamını birleştirip "tek bir mesaj" olarak yolluyoruz.
+    // ChatHistory zaten aktif olduğu için, önceki soruları hatırlayacak.
+    const messageToSend = `
+      [VERİTABANI BİLGİSİ]:
+      ${contextData}
+
+      [KULLANICININ SORUSU]:
+      ${question}
+    `;
+
+    // .generateContent YERİNE artık .sendMessage kullanıyoruz!
+    const currentChat = activeChats[sessionId];
+    const chatResult = await currentChat.sendMessage(messageToSend);
+    
+    const answer = await chatResult.response.text();
 
     res.json({ 
-      message: "PDF başarıyla işlendi ve veritabanına kaydedildi.",
-      fileName: req.file.originalname,
-      totalChunksSaved: successCount 
+      sessionId: sessionId,
+      answer: answer 
     });
 
   } catch (error) {
-    console.error("❌ Dosya İşleme Hatası:", error);
-    res.status(500).json({ error: "PDF işlenirken bir hata oluştu: " + error.message });
+    console.error("❌ Chat Hatası:", error);
+    res.status(500).json({ error: error.message });
   } finally {
     client.release();
   }
 });
 
 // ==========================================
-// 💬 ESKİ ENDPOINT: SOHBET (CHAT)
+// 🗑️ YENİ ENDPOINT: HAFIZAYI SİL
 // ==========================================
-app.post("/api/chat", async (req, res) => {
-  const { question } = req.body;
-  if (!question) return res.status(400).json({ error: "Soru eksik." });
-
-  const client = await pool.connect();
-  try {
-    const embeddingResult = await embeddingModel.embedContent(question);
-    const vectorStr = JSON.stringify(embeddingResult.embedding.values);
-
-    const sql = `SELECT content, (embedding <=> $1) as distance FROM documents ORDER BY distance ASC LIMIT 3;`;
-    const result = await client.query(sql, [vectorStr]);
-
-    if (result.rows.length === 0) return res.json({ answer: "Veritabanında bilgi yok." });
-
-    const context = result.rows.map(r => r.content).join("\n\n---\n\n");
-    const prompt = `Aşağıdaki BİLGİLERİ kullanarak soruyu cevapla. Bilgilerde yoksa "Bilgim yok" de.\n\nBİLGİLER:\n${context}\n\nSORU:\n${question}`;
-
-    const chatResult = await chatModel.generateContent(prompt);
-    res.json({ answer: await chatResult.response.text()});
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  } finally {
-    client.release();
+app.delete("/api/chat/:sessionId", (req, res) => {
+  const { sessionId } = req.params;
+  if (activeChats[sessionId]) {
+    delete activeChats[sessionId];
+    res.json({ message: `Hafıza silindi: ${sessionId}` });
+  } else {
+    res.json({ message: "Bu oturum zaten yok." });
   }
 });
 
