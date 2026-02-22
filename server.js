@@ -18,7 +18,7 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const embeddingModel = genAI.getGenerativeModel({ model: process.env.GEMINI_EMBEDDING_MODEL });
 const chatModel = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL });
 
-// --- 2. Express ve Multer Ayarları ---
+// --- 2. Express Ayarları ---
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -39,11 +39,6 @@ function splitTextIntoChunks(text, size, overlap) {
 }
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// ==========================================
-// 🧠 YENİ: SOHBET HAFIZASI YÖNETİMİ
-// ==========================================
-// Kullanıcıların aktif sohbet oturumlarını burada saklayacağız.
-// Key: sessionId (Örn: "user123"), Value: Gemini Chat Objesi
 const activeChats = {};
 
 // ==========================================
@@ -81,51 +76,41 @@ app.post("/api/upload", upload.single("document"), async (req, res) => {
 
 
 // ==========================================
-// 💬 ENDPOINT: SOHBET (CHAT HISTORY DESTEKLİ)
+// 🌊 ENDPOINT: SOHBET (STREAMING & HISTORY)
 // ==========================================
-// Artık body'den 'question' yanında opsiyonel olarak 'sessionId' bekliyoruz.
 app.post("/api/chat", async (req, res) => {
   const { question, sessionId = "default_session" } = req.body;
   if (!question) return res.status(400).json({ error: "Soru eksik." });
 
+  // 1. STREAMING İÇİN HTTP BAŞLIKLARINI AYARLA (SSE Formatı)
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+
   const client = await pool.connect();
   
   try {
-    // 1. SORUYU VEKTÖRE ÇEVİR VE VERİTABANINDA ARA (Klasik RAG)
+    // 2. RAG: Soruyu vektöre çevir ve ara
     const embeddingResult = await embeddingModel.embedContent(question);
     const vectorStr = JSON.stringify(embeddingResult.embedding.values);
 
     const sql = `SELECT content, (embedding <=> $1) as distance FROM documents ORDER BY distance ASC LIMIT 3;`;
     const result = await client.query(sql, [vectorStr]);
     
-    // Veritabanından gelen bilgileri birleştir
     const contextData = result.rows.length > 0 
       ? result.rows.map(r => r.content).join("\n\n---\n\n")
       : "Veritabanında bu soruya dair doğrudan bir bilgi bulunamadı.";
 
-    // 2. OTURUM (SESSION) KONTROLÜ VE OLUŞTURMA
-    // Eğer bu sessionId için daha önce bir sohbet başlatılmadıysa, yeni başlat.
+    // 3. HAFIZA (HISTORY) KONTROLÜ
     if (!activeChats[sessionId]) {
-      console.log(`🆕 Yeni bir sohbet oturumu başlatılıyor: [${sessionId}]`);
-      
       activeChats[sessionId] = chatModel.startChat({
-        // İsteğe bağlı: Başlangıçta modele "Sen kimsin?" gibi sistem talimatları verebiliriz.
         history: [
-          {
-            role: "user",
-            parts: [{ text: "Sen profesyonel bir asistansın. Sana vereceğim [VERİTABANI BİLGİSİ] bloklarına dayanarak sorularımı cevapla." }],
-          },
-          {
-            role: "model",
-            parts: [{ text: "Anladım. Sadece verdiğiniz bilgilere dayanarak cevap vereceğim." }],
-          },
+          { role: "user", parts: [{ text: "Sen profesyonel bir asistansın. Sana vereceğim [VERİTABANI BİLGİSİ] bloklarına dayanarak sorularımı cevapla." }] },
+          { role: "model", parts: [{ text: "Anladım. Sadece verdiğiniz bilgilere dayanarak cevap vereceğim." }] },
         ]
       });
     }
 
-    // 3. YAPAY ZEKAYA MESAJ GÖNDERME
-    // Kullanıcının sorusunu ve o anki veritabanı bağlamını birleştirip "tek bir mesaj" olarak yolluyoruz.
-    // ChatHistory zaten aktif olduğu için, önceki soruları hatırlayacak.
     const messageToSend = `
       [VERİTABANI BİLGİSİ]:
       ${contextData}
@@ -134,27 +119,33 @@ app.post("/api/chat", async (req, res) => {
       ${question}
     `;
 
-    // .generateContent YERİNE artık .sendMessage kullanıyoruz!
+    // 4. STREAMING İŞLEMİ (Büyünün gerçekleştiği yer)
     const currentChat = activeChats[sessionId];
-    const chatResult = await currentChat.sendMessage(messageToSend);
-    
-    const answer = await chatResult.response.text();
+    const chatResult = await currentChat.sendMessageStream(messageToSend); // sendMessageStream kullanıyoruz!
 
-    res.json({ 
-      sessionId: sessionId,
-      answer: answer 
-    });
+    // Gelen her kelime öbeğini (chunk) anında istemciye (frontend/terminal) akıtıyoruz
+    for await (const chunk of chatResult.stream) {
+      const chunkText = chunk.text();
+      // Server-Sent Events (SSE) standardına uygun formatta veri gönderimi:
+      res.write(`data: ${JSON.stringify({ text: chunkText })}\n\n`);
+    }
+
+    // Akış bittiğinde bağlantıyı kapat
+    res.write("data: [DONE]\n\n");
+    res.end();
 
   } catch (error) {
     console.error("❌ Chat Hatası:", error);
-    res.status(500).json({ error: error.message });
+    // Stream başladıysa status değiştiremeyiz, bu yüzden hata mesajını stream olarak yollayıp kapatıyoruz
+    res.write(`data: ${JSON.stringify({ error: error.message })}\n\n`);
+    res.end();
   } finally {
     client.release();
   }
 });
 
 // ==========================================
-// 🗑️ YENİ ENDPOINT: HAFIZAYI SİL
+// 🗑️ ENDPOINT: HAFIZAYI SİL
 // ==========================================
 app.delete("/api/chat/:sessionId", (req, res) => {
   const { sessionId } = req.params;
